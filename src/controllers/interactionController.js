@@ -1,0 +1,161 @@
+const interactionService = require('../services/interactionService');
+const catchAsync = require('../utils/catchAsync');
+
+exports.createRepost = catchAsync(async (req, res) => {
+  const userId = req.user.id;
+  // Support taking the ID from the URL OR the body
+  const targetId = req.params.id || req.body.targetId;
+  // Default to 'Track' if they don't provide a targetModel
+  const targetModel = req.body.targetModel || 'Track';
+
+  const result = await interactionService.addRepost(
+    userId,
+    targetId,
+    targetModel
+  );
+
+  res.status(201).json({
+    success: true,
+    message: `${targetModel} reposted successfully`,
+    data: result,
+  });
+});
+
+exports.deleteRepost = catchAsync(async (req, res) => {
+  const userId = req.user.id;
+  const targetId = req.params.id || req.body.targetId;
+  const targetModel = req.body.targetModel || 'Track';
+
+  const result = await interactionService.removeRepost(
+    userId,
+    targetId,
+    targetModel
+  );
+
+  res.status(200).json({
+    success: true,
+    message: 'Repost removed successfully',
+    data: result,
+  });
+});
+
+exports.getTrackReposters = catchAsync(async (req, res) => {
+  const { id: trackId } = req.params;
+  const { page, limit } = req.query;
+  const result = await interactionService.getTrackEngagers(
+    trackId,
+    'REPOST',
+    page,
+    limit
+  );
+  res.status(200).json({
+    success: true,
+    message: 'Track reposters fetched successfully',
+    data: {
+      users: result.users,
+      pagination: {
+        total: result.total,
+        page: result.page,
+        totalPages: result.totalPages,
+      },
+    },
+  });
+});
+
+exports.getTrackLikers = catchAsync(async (req, res) => {
+  const { id: trackId } = req.params;
+  const { page, limit } = req.query;
+  const result = await interactionService.getTrackEngagers(
+    trackId,
+    'LIKE',
+    page,
+    limit
+  );
+  res.status(200).json({
+    success: true,
+    message: 'Track likers fetched successfully',
+    data: {
+      users: result.users,
+      pagination: {
+        total: result.total,
+        page: result.page,
+        totalPages: result.totalPages,
+      },
+    },
+  });
+});
+
+exports.getUserRepostsFeed = catchAsync(async (req, res) => {
+  const { userId } = req.params;
+  const { page, limit } = req.query;
+  const result = await interactionService.getUserReposts(userId, page, limit);
+  res.status(200).json({
+    success: true,
+    message: 'User reposts feed fetched successfully',
+    data: {
+      repostedTracks: result.repostedTracks,
+      pagination: {
+        total: result.total,
+        page: result.page,
+        totalPages: result.totalPages,
+      },
+    },
+  });
+});
+
+exports.getUserLikesFeed = catchAsync(async (req, res) => {
+  const { userId } = req.params;
+  const { page, limit } = req.query;
+  const result = await interactionService.getUserLikes(userId, page, limit);
+  res.status(200).json({
+    success: true,
+    message: 'User likes feed fetched successfully',
+    data: {
+      likedTracks: result.likedTracks,
+      pagination: {
+        total: result.total,
+        page: result.page,
+        totalPages: result.totalPages,
+      },
+    },
+  });
+});
+
+// BE-1: Yehia's Like Controllers
+exports.createLike = catchAsync(async (req, res) => {
+  const userId = req.user.id;
+  // Support taking the ID from the URL OR the body
+  const targetId = req.params.id || req.body.targetId;
+  // Default to 'Track' if they don't provide a targetModel
+  const targetModel = req.body.targetModel || 'Track';
+
+  const result = await interactionService.addLike(
+    userId,
+    targetId,
+    targetModel
+  );
+
+  res.status(201).json({
+    success: true,
+    message: `${targetModel} liked successfully`,
+    data: result,
+  });
+});
+
+exports.deleteLike = catchAsync(async (req, res) => {
+  const userId = req.user.id;
+  const targetId = req.params.id || req.body.targetId;
+  const targetModel = req.body.targetModel || 'Track';
+
+  const result = await interactionService.removeLike(
+    userId,
+    targetId,
+    targetModel
+  );
+
+  res.status(200).json({
+    success: true,
+    message: `Like removed successfully`,
+    data: result,
+  });
+});

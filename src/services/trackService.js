@@ -1,0 +1,471 @@
+const {
+  BlobServiceClient,
+  generateBlobSASQueryParameters,
+  BlobSASPermissions,
+  StorageSharedKeyCredential,
+} = require('@azure/storage-blob');
+const Track = require('../models/trackModel');
+const { uploadImageToAzure } = require('../utils/azureStorage');
+const { publishToQueue } = require('../utils/queueProducer');
+const notificationService = require('./notificationService');
+const Follow = require('../models/followModel');
+const AppError = require('../utils/appError');
+// ==========================================
+// BE-3: METADATA & VISIBILITY LOGIC
+// ==========================================
+
+/**
+ * Updates track metadata (title, description, genre, tags, releaseDate)
+ */
+/**
+ * Updates track metadata (title, description, genre, tags, releaseDate)
+ */
+/**
+ * Updates track metadata (title, description, genre, tags, releaseDate)
+ */
+exports.updateTrackMetadata = async (trackId, user, metadataBody) => {
+  const allowedUpdates = {};
+  const allowedFields = [
+    'title',
+    'description',
+    'genre',
+    'tags',
+    'releaseDate',
+    'isPublic',
+    'isrc',
+    'iswc',
+    'composer',
+    'publisher',
+    'releaseTitle',
+    'albumTitle',
+    'recordLabel',
+    'barcode',
+    'pLine',
+    'license',
+    'containsExplicitContent',
+    'buyLink',
+    'allowComments',
+    'displayStatsPublicly',
+    'enableDirectDownloads',
+    'enableContentId',
+    'includeInRssFeed',
+    'previewStartTime',
+    'previewEndTime',
+  ];
+
+  allowedFields.forEach((field) => {
+    if (metadataBody[field] !== undefined) {
+      allowedUpdates[field] = metadataBody[field];
+    }
+  });
+
+  // ARTIST PRO CHECK: Scheduled Release Logic
+  if (allowedUpdates.releaseDate) {
+    const scheduledDate = new Date(allowedUpdates.releaseDate);
+    const now = new Date();
+
+    if (scheduledDate > now) {
+      // STRICT SEPARATION: Only 'Pro' users can schedule future releases
+      if (user.subscriptionPlan !== 'Pro') {
+        throw new AppError(
+          'Scheduling a future release requires an Artist Pro subscription.',
+          403
+        );
+      }
+    }
+  }
+
+  const track = await Track.findOneAndUpdate(
+    { _id: trackId, artist: user._id },
+    { $set: allowedUpdates },
+    { new: true, runValidators: true }
+  );
+
+  if (!track) {
+    throw new AppError(
+      'Track not found or you do not have permission to edit it',
+      404
+    );
+  }
+
+  return track;
+};
+
+exports.getMyTracks = async (userId) => {
+  const tracks = await Track.find({
+    artist: userId,
+    processingState: 'Finished',
+  })
+    .select('-audioUrl')
+    .sort({ createdAt: -1 });
+
+  return tracks;
+};
+
+/**
+ * Toggles the track between Public and Private
+ */
+exports.toggleTrackVisibility = async (trackId, userId, isPublic) => {
+  const track = await Track.findById(trackId);
+  if (!track) {
+    throw new AppError('Track not found', 404);
+  }
+
+  if (track.artist.toString() !== userId.toString()) {
+    throw new AppError('You do not have permission to edit this track', 403);
+  }
+
+  // Update visibility
+  track.isPublic = isPublic;
+  await track.save();
+
+  return track;
+};
+/**
+ * Uploads a new artwork image to Azure and updates the track
+ */
+exports.updateTrackArtwork = async (trackId, userId, file) => {
+  const track = await Track.findById(trackId);
+
+  if (!track) {
+    throw new AppError('Track not found', 404);
+  }
+
+  if (track.artist.toString() !== userId.toString()) {
+    throw new AppError('You do not have permission to edit this track', 403);
+  }
+
+  // Upload the buffer to Azure Blob Storage
+  const artworkUrl = await uploadImageToAzure(
+    file.buffer,
+    file.originalname,
+    'artworks'
+  );
+
+  // Update the track document
+  track.artworkUrl = artworkUrl;
+  await track.save();
+
+  return track;
+};
+
+// 1. GENERATE SAS TOKEN & CHECK LIMITS
+exports.generateUploadUrl = async (user, trackData) => {
+  const {
+    title,
+    format,
+    size,
+    duration,
+    description,
+    genre,
+    tags,
+    isPublic,
+    releaseDate,
+    isrc,
+    iswc,
+    composer,
+    publisher,
+    releaseTitle,
+    albumTitle,
+    recordLabel,
+    barcode,
+    pLine,
+    license,
+    containsExplicitContent,
+    buyLink,
+    allowComments,
+    displayStatsPublicly,
+    enableDirectDownloads,
+    enableContentId,
+    includeInRssFeed,
+    previewStartTime,
+    previewEndTime,
+  } = trackData;
+  // Module 12: Premium Subscriptions (Upload Limit Check)
+  // ONLY Pro users bypass the limit
+  if (user.subscriptionPlan !== 'Pro') {
+    const trackCount = await Track.countDocuments({ artist: user._id });
+    if (trackCount >= 3) {
+      throw new AppError(
+        'Upload limit reached. Free and Go+ accounts are limited to 3 tracks. Please upgrade to Pro.',
+        403
+      );
+    }
+  }
+
+  // Determine the final release date based on their account type
+  const canScheduleRelease = user.subscriptionPlan === 'Pro';
+  let finalReleaseDate;
+  if (canScheduleRelease && releaseDate) {
+    finalReleaseDate = releaseDate;
+  } else {
+    finalReleaseDate = Date.now();
+  }
+
+  const ALLOWED_FORMATS = [
+    'audio/mpeg',
+    'audio/mp3',
+    'audio/wav',
+    'audio/x-wav',
+    'audio/wave',
+  ];
+  if (!format || !ALLOWED_FORMATS.includes(format)) {
+    throw new AppError(
+      `Unsupported format "${format}". Accepted formats: MP3 (audio/mpeg) and WAV (audio/wav).`,
+      400
+    );
+  }
+
+  const accountName = process.env.AZURE_ACCOUNT_NAME;
+  const accountKey = process.env.AZURE_ACCOUNT_KEY;
+  const containerName = process.env.AZURE_CONTAINER_NAME || 'biobeats-audio';
+
+  const sharedKeyCredential = new StorageSharedKeyCredential(
+    accountName,
+    accountKey
+  );
+
+  const uniqueSuffix = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+  const extension = format.includes('wav') ? '.wav' : '.mp3';
+  const blobName = `track-${uniqueSuffix}${extension}`;
+
+  const sasOptions = {
+    containerName,
+    blobName,
+    permissions: BlobSASPermissions.parse('cw'), // create & write
+    startsOn: new Date(),
+    expiresOn: new Date(new Date().valueOf() + 15 * 60 * 1000), // 15 mins
+    contentLengthRange: { min: 0, max: 500 * 1024 * 1024 }, //limit the track upload to 500 mb
+  };
+
+  const sasToken = generateBlobSASQueryParameters(
+    sasOptions,
+    sharedKeyCredential
+  ).toString();
+  const uploadUrl = `https://${accountName}.blob.core.windows.net/${containerName}/${blobName}?${sasToken}`;
+  const finalAudioUrl = `https://${accountName}.blob.core.windows.net/${containerName}/${blobName}`;
+
+  const newTrack = await Track.create({
+    title: title || 'Untitled Track',
+    artist: user._id,
+    format,
+    size,
+    duration: Math.round(duration),
+    audioUrl: finalAudioUrl,
+    processingState: 'Processing',
+    description,
+    genre,
+    tags,
+    isPublic: isPublic !== undefined ? isPublic : true,
+    releaseDate: finalReleaseDate,
+    isrc,
+    iswc,
+    composer,
+    publisher,
+    releaseTitle,
+    albumTitle,
+    recordLabel,
+    barcode,
+    pLine,
+    license,
+    containsExplicitContent,
+    buyLink,
+    allowComments,
+    displayStatsPublicly,
+    enableDirectDownloads,
+    enableContentId,
+    includeInRssFeed,
+    previewStartTime: previewStartTime !== undefined ? previewStartTime : 0,
+    previewEndTime: previewEndTime !== undefined ? previewEndTime : 20,
+  });
+
+  return { trackId: newTrack._id, uploadUrl };
+};
+
+// 2. CONFIRM UPLOAD SUCCESS
+exports.confirmUpload = async (trackId, userId) => {
+  const track = await Track.findOne({ _id: trackId, artist: userId });
+  if (!track) {
+    throw new AppError('Track not found.', 404);
+  }
+
+  // 1. Instantly update the database status to 'Processing'
+  track.processingState = 'Processing';
+  await track.save();
+
+  // 2. Create the ticket payload with exactly what the worker needs
+  const ticketData = {
+    trackId: track._id.toString(),
+    audioUrl: track.audioUrl,
+  };
+
+  // 3. Drop the ticket into the RabbitMQ queue!
+  // It only takes ~50 milliseconds to send this to the cloud.
+  await publishToQueue('audio_processing_queue_v4', ticketData);
+
+  // ==========================================
+  // MODULE 10: NEW TRACK NOTIFICATION
+  // ==========================================
+  // We use a Promise chain here so it runs entirely in the background
+  // and doesn't block the user's upload confirmation response.
+  if (track.isPublic) {
+    Follow.find({ following: userId })
+      .then((followers) => {
+        followers.forEach((followDoc) => {
+          notificationService.notifyNewTrack(
+            followDoc.follower, // Recipient
+            userId, // Actor (The Artist)
+            track._id // Target (The Track)
+          );
+        });
+      })
+      .catch((err) => {
+        console.error(
+          '[Notification Error] Failed to fetch followers for new track alert:',
+          err
+        );
+      });
+  }
+
+  // 4. Return immediately to the user so the frontend doesn't hang
+  return track;
+};
+
+// 3. FETCH SINGLE TRACK (Public streaming)
+exports.getTrackByPermalink = async (permalink, requestingUserId = null) => {
+  const track = await Track.findOne({ permalink })
+    .select('-audioUrl')
+    .populate('artist', 'displayName permalink avatarUrl isPremium');
+
+  if (!track || track.processingState !== 'Finished') {
+    throw new AppError('Track not found or is still processing.', 404);
+  }
+
+  if (track.releaseDate > new Date()) {
+    throw new AppError('Track not found.', 404);
+  }
+
+  // ==========================================
+  // NEW SECURITY LOGIC: PROTECT MODERATED & PRIVATE TRACKS
+  // ==========================================
+
+  // Is the person requesting this the actual artist?
+  const isOwner =
+    requestingUserId &&
+    track.artist._id.toString() === requestingUserId.toString();
+
+  // 1. ADMIN MODERATION CHECK (NEW)
+  if (track.moderationStatus === 'Hidden_By_Admin') {
+    if (!isOwner) {
+      // If a regular user tries to listen, block them!
+      throw new AppError(
+        'This track has been removed by an Administrator.',
+        403
+      );
+    }
+  }
+
+  // 2. REGULAR PRIVATE TRACK CHECK (Your existing logic)
+  if (track.isPublic === false) {
+    if (!isOwner) {
+      throw new AppError('This track is private and cannot be accessed.', 403);
+    }
+  }
+
+  if (!track.displayStatsPublicly) {
+    track.playCount = undefined;
+    track.likeCount = undefined;
+    track.repostCount = undefined;
+    track.commentCount = undefined;
+  }
+
+  return track;
+};
+
+// 4. DOWNLOAD TRACK (Module 12: Premium Offline Listening)
+exports.downloadTrackAudio = async (trackId, user) => {
+  // ONLY Go+ users get offline listening
+  if (user.subscriptionPlan !== 'Go+') {
+    throw new AppError(
+      'Requires a Go+ Subscription for offline listening.',
+      403
+    );
+  }
+
+  const track = await Track.findById(trackId);
+  if (!track || track.processingState !== 'Finished') {
+    throw new AppError('Track not found or not ready.', 404);
+  }
+
+  if (!track.enableDirectDownloads) {
+    throw new AppError(
+      'The artist has not enabled direct downloads for this track.',
+      403
+    );
+  }
+
+  const connectionString = process.env.AZURE_STORAGE_CONNECTION_STRING;
+  const containerName = process.env.AZURE_CONTAINER_NAME;
+  const blobServiceClient =
+    BlobServiceClient.fromConnectionString(connectionString);
+  const containerClient = blobServiceClient.getContainerClient(containerName);
+
+  const blobName = track.audioUrl.split('/').pop();
+  const blobClient = containerClient.getBlobClient(blobName);
+
+  const downloadResponse = await blobClient.download(0);
+
+  return {
+    stream: downloadResponse.readableStreamBody,
+    contentType: downloadResponse.contentType,
+    contentLength: downloadResponse.contentLength,
+    filename: `${track.title.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.mp3`,
+  };
+};
+
+// 5. DELETE TRACK (From MongoDB and Azure)
+exports.deleteTrack = async (trackId, userId) => {
+  // 1. Find the track
+  const track = await Track.findById(trackId);
+
+  if (!track) {
+    throw new AppError('Track not found.', 404);
+  }
+
+  // 2. Security Check: Only the owner can delete their track
+  if (track.artist.toString() !== userId.toString()) {
+    throw new AppError(
+      'Unauthorized: You can only delete your own tracks.',
+      403
+    );
+  }
+
+  // 3. Delete the physical file from Azure Blob Storage
+  if (track.audioUrl) {
+    try {
+      const connectionString = process.env.AZURE_STORAGE_CONNECTION_STRING;
+      const containerName =
+        process.env.AZURE_CONTAINER_NAME || 'biobeats-audio';
+      const blobServiceClient =
+        BlobServiceClient.fromConnectionString(connectionString);
+      const containerClient =
+        blobServiceClient.getContainerClient(containerName);
+
+      // Extract the exact filename from the URL
+      const blobName = track.audioUrl.split('/').pop();
+      const blobClient = containerClient.getBlobClient(blobName);
+
+      // Delete the file from the cloud
+      await blobClient.deleteIfExists();
+      console.log(`[Azure] Successfully deleted blob: ${blobName}`);
+    } catch (azureError) {
+      console.error('[Azure Error] Failed to delete file:', azureError.message);
+      // We log the error but still proceed to delete the DB record so the user isn't stuck
+    }
+  }
+
+  // 4. Delete the document from MongoDB
+  await track.deleteOne();
+
+  return true;
+};
